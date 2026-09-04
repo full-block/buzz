@@ -135,7 +135,7 @@ async fn open_connection(
     let connect_cancel = manager.connect_cancel.lock().await.clone();
     let (socket, _) = tokio::select! {
         _ = connect_cancel.cancelled() => return Err("WebSocket connection cancelled".to_string()),
-        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url)) => result
+        result = tokio::time::timeout(CONNECT_TIMEOUT, crate::rustls_extra_ca::connect_async_with_extra_cas(url)) => result
             .map_err(|_| "WebSocket connection timed out".to_string())?
             .map_err(|error| error.to_string())?,
     };

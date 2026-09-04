@@ -79,7 +79,7 @@ async fn connect_authenticated_audio_socket(
     use nostr::JsonUtil;
 
     let ws_url = format!("{relay_url}/huddle/{channel_id}/audio");
-    let (ws_stream, _) = connect_async(&ws_url)
+    let (ws_stream, _) = crate::rustls_extra_ca::connect_async_with_extra_cas(&ws_url)
         .await
         .map_err(|e| format!("audio WS connect failed: {e}"))?;
     let (mut ws_tx, mut ws_rx) = ws_stream.split();

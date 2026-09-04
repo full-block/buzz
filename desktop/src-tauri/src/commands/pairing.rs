@@ -303,7 +303,7 @@ async fn pairing_ws_task_inner(
     outbound_rx: &mut mpsc::Receiver<String>,
     app: &AppHandle,
 ) -> Result<(), String> {
-    let (ws, _) = connect_async(relay_url)
+    let (ws, _) = crate::rustls_extra_ca::connect_async_with_extra_cas(relay_url)
         .await
         .map_err(|e| format!("WebSocket connection failed: {e}"))?;
     let (mut write, mut read) = ws.split();

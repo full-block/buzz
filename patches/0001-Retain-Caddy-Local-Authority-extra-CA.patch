@@ -1,0 +1,494 @@
+From 599e934a6ad758464f2e2cee10942e05fe2a6ca4 Mon Sep 17 00:00:00 2001
+From: Rick Farmer <rickfarmer@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 14:19:46 -0500
+Subject: [PATCH] Retain Caddy Local Authority extra-CA for wss://buzz.mpzl
+
+Keep rustls extra-CA trust wiring so Desktop and buzz-acp can
+connect to the local buzz.mpzl relay behind Caddy Local Authority.
+
+Signed-off-by: Cursor Agent <cursoragent@cursor.com>
+---
+ Cargo.lock                                | 12 +++
+ crates/buzz-acp/Cargo.toml                |  3 +
+ crates/buzz-acp/src/relay.rs              | 94 ++++++++++++++++++++++-
+ desktop/src-tauri/Cargo.lock              | 12 +++
+ desktop/src-tauri/Cargo.toml              |  8 +-
+ desktop/src-tauri/examples/wss_probe.rs   | 73 ++++++++++++++++++
+ desktop/src-tauri/src/commands/pairing.rs |  2 +-
+ desktop/src-tauri/src/huddle/relay_api.rs |  2 +-
+ desktop/src-tauri/src/lib.rs              |  1 +
+ desktop/src-tauri/src/native_websocket.rs |  2 +-
+ desktop/src-tauri/src/rustls_extra_ca.rs  | 86 +++++++++++++++++++++
+ 11 files changed, 288 insertions(+), 7 deletions(-)
+ create mode 100644 desktop/src-tauri/examples/wss_probe.rs
+ create mode 100644 desktop/src-tauri/src/rustls_extra_ca.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index e5769800..7c05f36e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -844,6 +844,8 @@ dependencies = [
+  "nostr 0.44.7",
+  "reqwest 0.13.4",
+  "rustls",
++ "rustls-native-certs",
++ "rustls-pemfile",
+  "serde",
+  "serde_json",
+  "sha2 0.11.0",
+@@ -856,6 +858,7 @@ dependencies = [
+  "tracing-subscriber",
+  "url",
+  "uuid",
++ "webpki-roots 0.26.11",
+ ]
+ 
+ [[package]]
+@@ -8134,6 +8137,15 @@ dependencies = [
+  "security-framework 3.7.0",
+ ]
+ 
++[[package]]
++name = "rustls-pemfile"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
++dependencies = [
++ "rustls-pki-types",
++]
++
+ [[package]]
+ name = "rustls-pki-types"
+ version = "1.14.1"
+diff --git a/crates/buzz-acp/Cargo.toml b/crates/buzz-acp/Cargo.toml
+index d0478498..5f87b464 100644
+--- a/crates/buzz-acp/Cargo.toml
++++ b/crates/buzz-acp/Cargo.toml
+@@ -33,6 +33,9 @@ tokio-tungstenite = { workspace = true }
+ # Codec (bounded line reads)
+ tokio-util = { workspace = true }
+ rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
++webpki-roots = "0.26"
++rustls-pemfile = "2"
++rustls-native-certs = "0.8"
+ futures-util = { workspace = true }
+ 
+ # HTTP (channel discovery REST API)
+diff --git a/crates/buzz-acp/src/relay.rs b/crates/buzz-acp/src/relay.rs
+index a019e758..d8009c9a 100644
+--- a/crates/buzz-acp/src/relay.rs
++++ b/crates/buzz-acp/src/relay.rs
+@@ -125,7 +125,10 @@ use nostr::{Event, EventBuilder, Keys, Kind, RelayUrl, Tag};
+ use serde_json::{json, Value};
+ use tokio::sync::mpsc;
+ use tokio::time::timeout;
+-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
++use tokio_tungstenite::{
++    connect_async, connect_async_tls_with_config, tungstenite::Message, Connector, MaybeTlsStream,
++    WebSocketStream,
++};
+ use tracing::{debug, info, warn};
+ use uuid::Uuid;
+ 
+@@ -4001,6 +4004,85 @@ where
+     Err(last_err.unwrap_or(RelayError::ConnectionClosed))
+ }
+ 
++
++/// Build a rustls connector that trusts Mozilla roots plus extra local CAs.
++///
++/// Extra PEMs (missing files are skipped):
++/// - `SSL_CERT_FILE` if set
++/// - `/Users/farmer/.mpzl/certs/caddy-local-authority.pem`
++/// - `$HOME/.mpzl/certs/caddy-local-authority.pem`
++/// - platform/keychain certs via rustls-native-certs
++fn rustls_connector_with_extra_cas() -> Connector {
++    let mut roots = rustls::RootCertStore::empty();
++    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
++
++    let mut extra = Vec::new();
++    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
++        extra.push(std::path::PathBuf::from(path));
++    }
++    extra.push(std::path::PathBuf::from(
++        "/Users/farmer/.mpzl/certs/caddy-local-authority.pem",
++    ));
++    if let Some(home) = std::env::var_os("HOME") {
++        extra.push(std::path::PathBuf::from(home).join(".mpzl/certs/caddy-local-authority.pem"));
++    }
++    extra.sort();
++    extra.dedup();
++
++    for path in extra {
++        add_pem_file_to_roots(&mut roots, &path);
++    }
++
++    let native = rustls_native_certs::load_native_certs();
++    for err in &native.errors {
++        debug!("native cert load: {err}");
++    }
++    let mut native_added = 0usize;
++    for cert in native.certs {
++        if roots.add(cert).is_ok() {
++            native_added += 1;
++        }
++    }
++    if native_added > 0 {
++        debug!("loaded {native_added} native/keychain CA cert(s)");
++    }
++
++    let config = rustls::ClientConfig::builder_with_provider(
++        rustls::crypto::ring::default_provider().into(),
++    )
++    .with_safe_default_protocol_versions()
++    .expect("rustls default protocol versions")
++    .with_root_certificates(roots)
++    .with_no_client_auth();
++
++    Connector::Rustls(std::sync::Arc::new(config))
++}
++
++fn add_pem_file_to_roots(roots: &mut rustls::RootCertStore, path: &std::path::Path) {
++    if !path.is_file() {
++        return;
++    }
++    let Ok(file) = std::fs::File::open(path) else {
++        warn!("failed to open extra CA {}", path.display());
++        return;
++    };
++    let mut reader = std::io::BufReader::new(file);
++    let mut added = 0usize;
++    for cert in rustls_pemfile::certs(&mut reader) {
++        match cert {
++            Ok(cert) => {
++                if roots.add(cert).is_ok() {
++                    added += 1;
++                }
++            }
++            Err(e) => warn!("failed to parse extra CA {}: {e}", path.display()),
++        }
++    }
++    if added > 0 {
++        info!("loaded {added} extra CA cert(s) from {}", path.display());
++    }
++}
++
+ /// Perform a single WebSocket connect + NIP-42 auth handshake.
+ ///
+ /// Returns `(ws, buffer)` on success.
+@@ -4013,7 +4095,15 @@ async fn do_connect(
+         .parse::<url::Url>()
+         .map_err(|e| RelayError::Http(format!("invalid relay URL: {e}")))?;
+ 
+-    let (ws, _response) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(parsed.as_str()))
++    let connect_fut = async {
++        if parsed.scheme() == "wss" {
++            let connector = rustls_connector_with_extra_cas();
++            connect_async_tls_with_config(parsed.as_str(), None, false, Some(connector)).await
++        } else {
++            connect_async(parsed.as_str()).await
++        }
++    };
++    let (ws, _response) = tokio::time::timeout(CONNECT_TIMEOUT, connect_fut)
+         .await
+         .map_err(|_| RelayError::ConnectionClosed)? // timeout → treat as connection failure
+         .map_err(|e| RelayError::WebSocket(Box::new(e)))?;
+diff --git a/desktop/src-tauri/Cargo.lock b/desktop/src-tauri/Cargo.lock
+index 6af27ee2..948e89ad 100644
+--- a/desktop/src-tauri/Cargo.lock
++++ b/desktop/src-tauri/Cargo.lock
+@@ -1139,6 +1139,8 @@ dependencies = [
+  "rubato",
+  "rusqlite",
+  "rustls",
++ "rustls-native-certs",
++ "rustls-pemfile",
+  "security-framework 3.7.0",
+  "serde",
+  "serde_json",
+@@ -1169,6 +1171,7 @@ dependencies = [
+  "user-idle",
+  "uuid",
+  "webkit2gtk",
++ "webpki-roots 0.26.11",
+  "window-vibrancy",
+  "windows-sys 0.61.2",
+  "zeroize",
+@@ -8954,6 +8957,15 @@ dependencies = [
+  "security-framework 3.7.0",
+ ]
+ 
++[[package]]
++name = "rustls-pemfile"
++version = "2.2.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
++dependencies = [
++ "rustls-pki-types",
++]
++
+ [[package]]
+ name = "rustls-pki-types"
+ version = "1.15.0"
+diff --git a/desktop/src-tauri/Cargo.toml b/desktop/src-tauri/Cargo.toml
+index a7ae5229..e49af685 100644
+--- a/desktop/src-tauri/Cargo.toml
++++ b/desktop/src-tauri/Cargo.toml
+@@ -22,11 +22,12 @@ name = "buzz_lib"
+ crate-type = ["staticlib", "cdylib", "rlib"]
+ 
+ [features]
+-default = ["system-keyring"]
++default = ["system-keyring", "custom-protocol"]
+ mesh-llm = ["dep:iroh", "dep:mesh-llm-sdk", "dep:mesh-llm-host-runtime", "dep:mesh-llm-client", "dep:mesh-llm-node", "dep:mesh-llm-system", "dep:mesh-llm-events"]
+ # OS keyring backing for desktop secret storage (nsec private keys). When
+ # disabled, secrets fall back to 0o600 files. On by default for real builds.
+ system-keyring = ["dep:keyring"]
++custom-protocol = ["tauri/custom-protocol"]
+ 
+ [build-dependencies]
+ base64 = "0.22"
+@@ -71,7 +72,7 @@ user-idle = { version = "0.6", default-features = false }
+ atomic-write-file = "0.3"
+ anyhow = "1"
+ dirs = "6"
+-tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
++tauri = { version = "2", features = ["macos-private-api", "tray-icon", "custom-protocol"] }
+ tauri-plugin-deep-link = "2"
+ tauri-plugin-opener = "2"
+ tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+@@ -101,6 +102,9 @@ zeroize = "1"
+ percent-encoding = "2"
+ reqwest = { version = "0.13", features = ["json", "query", "stream", "blocking"] }
+ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
++webpki-roots = "0.26"
++rustls-pemfile = "2"
++rustls-native-certs = "0.8"
+ url = "2"
+ buzz_core_pkg = { package = "buzz-core", path = "../../crates/buzz-core" }
+ buzz_persona_pkg = { package = "buzz-persona", path = "../../crates/buzz-persona" }
+diff --git a/desktop/src-tauri/examples/wss_probe.rs b/desktop/src-tauri/examples/wss_probe.rs
+new file mode 100644
+index 00000000..170365fb
+--- /dev/null
++++ b/desktop/src-tauri/examples/wss_probe.rs
+@@ -0,0 +1,73 @@
++//! One-shot wss probe using the same extra-CA rustls pattern as rustls_extra_ca.rs
++use std::process::ExitCode;
++
++fn rustls_connector_with_extra_cas() -> tokio_tungstenite::Connector {
++    let mut roots = rustls::RootCertStore::empty();
++    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
++
++    let mut extra = Vec::new();
++    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
++        extra.push(std::path::PathBuf::from(path));
++    }
++    extra.push(std::path::PathBuf::from(
++        "/Users/farmer/.mpzl/certs/caddy-local-authority.pem",
++    ));
++    if let Some(home) = std::env::var_os("HOME") {
++        extra.push(std::path::PathBuf::from(home).join(".mpzl/certs/caddy-local-authority.pem"));
++    }
++    extra.sort();
++    extra.dedup();
++
++    for path in extra {
++        if !path.is_file() {
++            continue;
++        }
++        let Ok(file) = std::fs::File::open(&path) else {
++            continue;
++        };
++        let mut reader = std::io::BufReader::new(file);
++        for cert in rustls_pemfile::certs(&mut reader).flatten() {
++            let _ = roots.add(cert);
++        }
++    }
++
++    let native = rustls_native_certs::load_native_certs();
++    for cert in native.certs {
++        let _ = roots.add(cert);
++    }
++
++    let config = rustls::ClientConfig::builder_with_provider(
++        rustls::crypto::aws_lc_rs::default_provider().into(),
++    )
++    .with_safe_default_protocol_versions()
++    .expect("rustls default protocol versions")
++    .with_root_certificates(roots)
++    .with_no_client_auth();
++
++    tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(config))
++}
++
++#[tokio::main(flavor = "current_thread")]
++async fn main() -> ExitCode {
++    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
++    let url = std::env::args()
++        .nth(1)
++        .unwrap_or_else(|| "wss://buzz.mpzl".to_string());
++    let result = if url.starts_with("wss://") {
++        let connector = rustls_connector_with_extra_cas();
++        tokio_tungstenite::connect_async_tls_with_config(url.as_str(), None, false, Some(connector))
++            .await
++    } else {
++        tokio_tungstenite::connect_async(url.as_str()).await
++    };
++    match result {
++        Ok((_ws, response)) => {
++            println!("status={} headers={:?}", response.status(), response.headers());
++            ExitCode::SUCCESS
++        }
++        Err(err) => {
++            eprintln!("error={err}");
++            ExitCode::FAILURE
++        }
++    }
++}
+diff --git a/desktop/src-tauri/src/commands/pairing.rs b/desktop/src-tauri/src/commands/pairing.rs
+index aedd6785..80a0c784 100644
+--- a/desktop/src-tauri/src/commands/pairing.rs
++++ b/desktop/src-tauri/src/commands/pairing.rs
+@@ -303,7 +303,7 @@ async fn pairing_ws_task_inner(
+     outbound_rx: &mut mpsc::Receiver<String>,
+     app: &AppHandle,
+ ) -> Result<(), String> {
+-    let (ws, _) = connect_async(relay_url)
++    let (ws, _) = crate::rustls_extra_ca::connect_async_with_extra_cas(relay_url)
+         .await
+         .map_err(|e| format!("WebSocket connection failed: {e}"))?;
+     let (mut write, mut read) = ws.split();
+diff --git a/desktop/src-tauri/src/huddle/relay_api.rs b/desktop/src-tauri/src/huddle/relay_api.rs
+index 190397aa..d60d88b9 100644
+--- a/desktop/src-tauri/src/huddle/relay_api.rs
++++ b/desktop/src-tauri/src/huddle/relay_api.rs
+@@ -79,7 +79,7 @@ async fn connect_authenticated_audio_socket(
+     use nostr::JsonUtil;
+ 
+     let ws_url = format!("{relay_url}/huddle/{channel_id}/audio");
+-    let (ws_stream, _) = connect_async(&ws_url)
++    let (ws_stream, _) = crate::rustls_extra_ca::connect_async_with_extra_cas(&ws_url)
+         .await
+         .map_err(|e| format!("audio WS connect failed: {e}"))?;
+     let (mut ws_tx, mut ws_rx) = ws_stream.split();
+diff --git a/desktop/src-tauri/src/lib.rs b/desktop/src-tauri/src/lib.rs
+index 43d7b038..eea3a44d 100644
+--- a/desktop/src-tauri/src/lib.rs
++++ b/desktop/src-tauri/src/lib.rs
+@@ -40,6 +40,7 @@ mod ptt_shortcut;
+ mod relay;
+ mod relay_admission;
+ mod reset;
++mod rustls_extra_ca;
+ mod secret_store;
+ mod shutdown;
+ mod team_catalog;
+diff --git a/desktop/src-tauri/src/native_websocket.rs b/desktop/src-tauri/src/native_websocket.rs
+index a7a51fb2..cc0d9756 100644
+--- a/desktop/src-tauri/src/native_websocket.rs
++++ b/desktop/src-tauri/src/native_websocket.rs
+@@ -135,7 +135,7 @@ async fn open_connection(
+     let connect_cancel = manager.connect_cancel.lock().await.clone();
+     let (socket, _) = tokio::select! {
+         _ = connect_cancel.cancelled() => return Err("WebSocket connection cancelled".to_string()),
+-        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url)) => result
++        result = tokio::time::timeout(CONNECT_TIMEOUT, crate::rustls_extra_ca::connect_async_with_extra_cas(url)) => result
+             .map_err(|_| "WebSocket connection timed out".to_string())?
+             .map_err(|error| error.to_string())?,
+     };
+diff --git a/desktop/src-tauri/src/rustls_extra_ca.rs b/desktop/src-tauri/src/rustls_extra_ca.rs
+new file mode 100644
+index 00000000..9a654b58
+--- /dev/null
++++ b/desktop/src-tauri/src/rustls_extra_ca.rs
+@@ -0,0 +1,86 @@
++//! rustls client connector that trusts Mozilla roots plus extra local CAs.
++//!
++//! Extra PEMs (missing files are skipped):
++//! - `SSL_CERT_FILE` if set
++//! - `/Users/farmer/.mpzl/certs/caddy-local-authority.pem`
++//! - `$HOME/.mpzl/certs/caddy-local-authority.pem`
++//! - platform/keychain certs via rustls-native-certs
++
++use tokio_tungstenite::{
++    connect_async, connect_async_tls_with_config,
++    tungstenite::{handshake::client::Response, Error as WsError},
++    Connector, MaybeTlsStream, WebSocketStream,
++};
++
++pub(crate) async fn connect_async_with_extra_cas(
++    url: &str,
++) -> Result<(WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>, Response), WsError> {
++    if let Some(rest) = url.strip_prefix("wss://") {
++        let _ = rest;
++        let connector = rustls_connector_with_extra_cas();
++        connect_async_tls_with_config(url, None, false, Some(connector)).await
++    } else {
++        connect_async(url).await
++    }
++}
++
++fn rustls_connector_with_extra_cas() -> Connector {
++    let mut roots = rustls::RootCertStore::empty();
++    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
++
++    let mut extra = Vec::new();
++    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
++        extra.push(std::path::PathBuf::from(path));
++    }
++    extra.push(std::path::PathBuf::from(
++        "/Users/farmer/.mpzl/certs/caddy-local-authority.pem",
++    ));
++    if let Some(home) = std::env::var_os("HOME") {
++        extra.push(std::path::PathBuf::from(home).join(".mpzl/certs/caddy-local-authority.pem"));
++    }
++    extra.sort();
++    extra.dedup();
++
++    for path in extra {
++        add_pem_file_to_roots(&mut roots, &path);
++    }
++
++    let native = rustls_native_certs::load_native_certs();
++    for err in &native.errors {
++        tracing::debug!("native cert load: {err}");
++    }
++    for cert in native.certs {
++        let _ = roots.add(cert);
++    }
++
++    let config = rustls::ClientConfig::builder_with_provider(
++        rustls::crypto::aws_lc_rs::default_provider().into(),
++    )
++    .with_safe_default_protocol_versions()
++    .expect("rustls default protocol versions")
++    .with_root_certificates(roots)
++    .with_no_client_auth();
++
++    Connector::Rustls(std::sync::Arc::new(config))
++}
++
++fn add_pem_file_to_roots(roots: &mut rustls::RootCertStore, path: &std::path::Path) {
++    if !path.is_file() {
++        return;
++    }
++    let Ok(file) = std::fs::File::open(path) else {
++        return;
++    };
++    let mut reader = std::io::BufReader::new(file);
++    let mut added = 0usize;
++    for cert in rustls_pemfile::certs(&mut reader) {
++        if let Ok(cert) = cert {
++            if roots.add(cert).is_ok() {
++                added += 1;
++            }
++        }
++    }
++    if added > 0 {
++        tracing::info!("loaded {added} extra CA cert(s) from {}", path.display());
++    }
++}
+-- 
+2.43.0
+

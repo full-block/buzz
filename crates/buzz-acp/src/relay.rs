@@ -125,7 +125,10 @@ use nostr::{Event, EventBuilder, Keys, Kind, RelayUrl, Tag};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async, connect_async_tls_with_config, tungstenite::Message, Connector, MaybeTlsStream,
+    WebSocketStream,
+};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -4001,6 +4004,85 @@ where
     Err(last_err.unwrap_or(RelayError::ConnectionClosed))
 }
 
+
+/// Build a rustls connector that trusts Mozilla roots plus extra local CAs.
+///
+/// Extra PEMs (missing files are skipped):
+/// - `SSL_CERT_FILE` if set
+/// - `/Users/farmer/.mpzl/certs/caddy-local-authority.pem`
+/// - `$HOME/.mpzl/certs/caddy-local-authority.pem`
+/// - platform/keychain certs via rustls-native-certs
+fn rustls_connector_with_extra_cas() -> Connector {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let mut extra = Vec::new();
+    if let Ok(path) = std::env::var("SSL_CERT_FILE") {
+        extra.push(std::path::PathBuf::from(path));
+    }
+    extra.push(std::path::PathBuf::from(
+        "/Users/farmer/.mpzl/certs/caddy-local-authority.pem",
+    ));
+    if let Some(home) = std::env::var_os("HOME") {
+        extra.push(std::path::PathBuf::from(home).join(".mpzl/certs/caddy-local-authority.pem"));
+    }
+    extra.sort();
+    extra.dedup();
+
+    for path in extra {
+        add_pem_file_to_roots(&mut roots, &path);
+    }
+
+    let native = rustls_native_certs::load_native_certs();
+    for err in &native.errors {
+        debug!("native cert load: {err}");
+    }
+    let mut native_added = 0usize;
+    for cert in native.certs {
+        if roots.add(cert).is_ok() {
+            native_added += 1;
+        }
+    }
+    if native_added > 0 {
+        debug!("loaded {native_added} native/keychain CA cert(s)");
+    }
+
+    let config = rustls::ClientConfig::builder_with_provider(
+        rustls::crypto::ring::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("rustls default protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+
+    Connector::Rustls(std::sync::Arc::new(config))
+}
+
+fn add_pem_file_to_roots(roots: &mut rustls::RootCertStore, path: &std::path::Path) {
+    if !path.is_file() {
+        return;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        warn!("failed to open extra CA {}", path.display());
+        return;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut added = 0usize;
+    for cert in rustls_pemfile::certs(&mut reader) {
+        match cert {
+            Ok(cert) => {
+                if roots.add(cert).is_ok() {
+                    added += 1;
+                }
+            }
+            Err(e) => warn!("failed to parse extra CA {}: {e}", path.display()),
+        }
+    }
+    if added > 0 {
+        info!("loaded {added} extra CA cert(s) from {}", path.display());
+    }
+}
+
 /// Perform a single WebSocket connect + NIP-42 auth handshake.
 ///
 /// Returns `(ws, buffer)` on success.
@@ -4013,7 +4095,15 @@ async fn do_connect(
         .parse::<url::Url>()
         .map_err(|e| RelayError::Http(format!("invalid relay URL: {e}")))?;
 
-    let (ws, _response) = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(parsed.as_str()))
+    let connect_fut = async {
+        if parsed.scheme() == "wss" {
+            let connector = rustls_connector_with_extra_cas();
+            connect_async_tls_with_config(parsed.as_str(), None, false, Some(connector)).await
+        } else {
+            connect_async(parsed.as_str()).await
+        }
+    };
+    let (ws, _response) = tokio::time::timeout(CONNECT_TIMEOUT, connect_fut)
         .await
         .map_err(|_| RelayError::ConnectionClosed)? // timeout → treat as connection failure
         .map_err(|e| RelayError::WebSocket(Box::new(e)))?;

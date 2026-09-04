@@ -22,11 +22,12 @@ name = "buzz_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-default = ["system-keyring"]
+default = ["system-keyring", "custom-protocol"]
 mesh-llm = ["dep:iroh", "dep:mesh-llm-sdk", "dep:mesh-llm-host-runtime", "dep:mesh-llm-client", "dep:mesh-llm-node", "dep:mesh-llm-system", "dep:mesh-llm-events"]
 # OS keyring backing for desktop secret storage (nsec private keys). When
 # disabled, secrets fall back to 0o600 files. On by default for real builds.
 system-keyring = ["dep:keyring"]
+custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
 base64 = "0.22"
@@ -71,7 +72,7 @@ user-idle = { version = "0.6", default-features = false }
 atomic-write-file = "0.3"
 anyhow = "1"
 dirs = "6"
-tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
+tauri = { version = "2", features = ["macos-private-api", "tray-icon", "custom-protocol"] }
 tauri-plugin-deep-link = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
@@ -101,6 +102,9 @@ zeroize = "1"
 percent-encoding = "2"
 reqwest = { version = "0.13", features = ["json", "query", "stream", "blocking"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+webpki-roots = "0.26"
+rustls-pemfile = "2"
+rustls-native-certs = "0.8"
 url = "2"
 buzz_core_pkg = { package = "buzz-core", path = "../../crates/buzz-core" }
 buzz_persona_pkg = { package = "buzz-persona", path = "../../crates/buzz-persona" }

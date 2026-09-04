@@ -40,6 +40,7 @@ mod ptt_shortcut;
 mod relay;
 mod relay_admission;
 mod reset;
+mod rustls_extra_ca;
 mod secret_store;
 mod shutdown;
 mod team_catalog;
